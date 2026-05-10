@@ -1,9 +1,12 @@
+import { useEffect, useState } from 'react'
 import { AVAILABLE_MODELS, type SetupStatus } from '@shared/types'
 import gemmaLogoUrl from '../assets/gemma-logo.png'
 
 interface Props {
   status: SetupStatus
   model: string
+  /** Timestamp (Date.now()) when the current slow stage was entered, for elapsed timer */
+  loadingStageEnteredAt?: number
   onModelChange: (m: string) => void
   onStart: (model: string) => void
 }
@@ -20,7 +23,27 @@ function formatBytes(n?: number): string {
   return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${u[i]}`
 }
 
-export default function Setup({ status, model, onModelChange, onStart }: Props) {
+/** Counts up from the given anchor timestamp while active is true. */
+function useElapsedSeconds(active: boolean, anchorMs?: number): number {
+  const [elapsed, setElapsed] = useState(0)
+  useEffect(() => {
+    if (!active) {
+      setElapsed(0)
+      return
+    }
+    const base = anchorMs ?? Date.now()
+    const tick = (): void => setElapsed(Math.round((Date.now() - base) / 1000))
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
+  }, [active, anchorMs])
+  return elapsed
+}
+
+export default function Setup({ status, model, loadingStageEnteredAt, onModelChange, onStart }: Props) {
+  const isSlowStage = status.stage === 'loading-model' || status.stage === 'starting-server'
+  const elapsed = useElapsedSeconds(isSlowStage, loadingStageEnteredAt)
+
   const isWorking =
     status.stage === 'checking' ||
     status.stage === 'installing-mlx' ||
@@ -37,6 +60,9 @@ export default function Setup({ status, model, onModelChange, onStart }: Props) 
     isWorking &&
     status.stage === 'downloading-model' &&
     status.progress != null
+
+  // Show a long-wait warning after 90 seconds in a slow stage
+  const showLongWaitHint = isSlowStage && elapsed > 90
 
   return (
     <div className="drag flex h-full w-full flex-col">
@@ -70,24 +96,49 @@ export default function Setup({ status, model, onModelChange, onStart }: Props) 
                 )}
               </div>
               {status.detail && (
-                <div className="mt-1 truncate text-[11px] text-ink-400">{status.detail}</div>
+                <div className="mt-1 truncate rounded bg-white/5 px-2 py-1 font-mono text-[10px] text-ink-400">
+                  {status.detail}
+                </div>
               )}
             </div>
           )}
 
-          {/* Loading / server-starting spinner with elapsed time */}
-          {isWorking &&
-            (status.stage === 'loading-model' || status.stage === 'starting-server') && (
-            <div className="mt-6 rounded-lg border border-white/5 bg-white/[0.03] px-4 py-3">
-              <div className="flex items-center gap-2">
-                <div className="shimmer h-1 w-16 rounded-full" />
-                <span className="text-[12px] text-ink-300">{status.message}</span>
-              </div>
-              {status.stage === 'loading-model' && (
+          {/* Loading / server-starting panel with live elapsed counter */}
+          {isSlowStage && (
+            <div className="mt-6 space-y-3">
+              <div className="rounded-lg border border-white/8 bg-white/[0.03] px-4 py-3">
+                {/* Header row: shimmer + message + elapsed timer */}
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <div className="shimmer h-1 w-12 shrink-0 rounded-full" />
+                    <span className="truncate text-[12px] text-ink-300">{status.message}</span>
+                  </div>
+                  <span className="shrink-0 tabular-nums text-[11px] text-ink-500">{elapsed}s</span>
+                </div>
+
+                {/* Last line of mlx output, if any */}
+                {status.detail && (
+                  <div className="mt-2 truncate rounded bg-black/30 px-2 py-1 font-mono text-[10px] text-ink-500">
+                    {status.detail}
+                  </div>
+                )}
+
+                {/* Contextual explanation */}
                 <p className="mt-2 text-[11px] leading-relaxed text-ink-500">
-                  Model weights are being mapped into RAM. Large models can take 1–2 minutes.
-                  Your Mac is not frozen — this is normal.
+                  {status.stage === 'loading-model'
+                    ? 'Mapping model weights into RAM. Large models can take 1–2 minutes on first load.'
+                    : 'Inference server is initialising — waiting for it to respond.'}
                 </p>
+              </div>
+
+              {/* Long-wait hint after 90 s */}
+              {showLongWaitHint && (
+                <div className="rounded-lg border border-yellow-500/20 bg-yellow-500/5 px-4 py-3 text-[11px] leading-relaxed text-yellow-300/70">
+                  <span className="font-medium text-yellow-300/90">Still loading ({elapsed}s).</span>{' '}
+                  {status.stage === 'loading-model'
+                    ? 'This is normal for large models on the first run — the OS is paging weights into RAM from disk. Activity Monitor → CPU tab should show Python actively running.'
+                    : 'The server process is running but not yet accepting connections. Check Activity Monitor if this continues.'}
+                </div>
               )}
             </div>
           )}
@@ -187,15 +238,15 @@ function WelcomeScreen({
 function StageList({ status }: { status: SetupStatus }) {
   // Each entry in the visual list maps to one or more internal stages
   const stages: Array<{ keys: SetupStatus['stage'][]; label: string }> = [
-    { keys: ['installing-mlx'],                               label: 'Install MLX runtime' },
-    { keys: ['starting-mlx'],                                 label: 'Start runtime' },
-    { keys: ['downloading-model'],                            label: 'Download model files' },
-    { keys: ['loading-model'],                                label: 'Load model into memory' },
-    { keys: ['starting-server'],                              label: 'Start server' },
-    { keys: ['ready'],                                        label: 'Ready to chat' },
+    { keys: ['installing-mlx'],   label: 'Install MLX runtime' },
+    { keys: ['starting-mlx'],     label: 'Start runtime' },
+    { keys: ['downloading-model'], label: 'Download model files' },
+    { keys: ['loading-model'],    label: 'Load model into memory' },
+    { keys: ['starting-server'],  label: 'Start server' },
+    { keys: ['ready'],            label: 'Ready to chat' },
   ]
 
-  // Ordered list of stages used to compute done / active / pending
+  // Ordered list used to compute done / active / pending
   const order: SetupStatus['stage'][] = [
     'checking',
     'installing-mlx',
@@ -210,7 +261,6 @@ function StageList({ status }: { status: SetupStatus }) {
   return (
     <div className="space-y-3">
       {stages.map((s) => {
-        // A stage row is "done" when all its keys are past, "active" when any key is current
         const indices = s.keys.map((k) => order.indexOf(k))
         const minIdx = Math.min(...indices)
         const maxIdx = Math.max(...indices)

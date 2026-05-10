@@ -275,9 +275,25 @@ export async function startServer(
   model: string,
   onProgress?: (p: ServerProgress) => void
 ): Promise<void> {
-  if (serverProc && !serverProc.killed && currentModel === model) return
+  // If server is already running with the correct model, still do a health
+  // check to confirm it is actually responding before declaring ready.
+  if (serverProc && !serverProc.killed && currentModel === model) {
+    if (onProgress) {
+      onProgress({ stage: 'starting-server', message: 'Connecting to existing server…' })
+    }
+    try {
+      const res = await fetch(`${MLX_URL}/v1/models`)
+      if (res.ok) {
+        console.log('[mlx] Existing server is healthy, reusing.')
+        return
+      }
+    } catch {
+      // Not responding — fall through and restart
+      console.log('[mlx] Existing server not responding, restarting…')
+    }
+  }
 
-  // Kill existing server if running with different model
+  // Kill any existing server before spawning a new one
   stopServer()
 
   const env = {
@@ -295,6 +311,11 @@ export async function startServer(
   let downloadComplete = false
   let loadingStarted = false
   let serverStarting = false
+  // Track whether we have seen any HF download progress so we know if the
+  // model is loading from cache (no download output) vs. downloading fresh.
+  let hasSeenDownloadProgress = false
+
+  const spawnTime = Date.now()
 
   console.log(`[mlx] Starting server: ${python} -m mlx_lm.server --model ${model} --port ${MLX_PORT}`)
 
@@ -313,7 +334,10 @@ export async function startServer(
     if (!onProgress) return
     if (p.stage === 'loading-model') loadingStarted = true
     if (p.stage === 'starting-server') serverStarting = true
-    if (p.stage === 'downloading-model' && p.progress === 1.0) downloadComplete = true
+    if (p.stage === 'downloading-model') {
+      hasSeenDownloadProgress = true
+      if (p.progress === 1.0) downloadComplete = true
+    }
     onProgress(p)
   }
 
@@ -340,12 +364,30 @@ export async function startServer(
   // Wait for the server to become healthy.
   // First run downloads model weights from HuggingFace, so allow up to 10 min.
   await waitForHealth(600_000, () => earlyExit, onProgress ? (elapsedSec) => {
+    const timeSinceSpawn = Date.now() - spawnTime
+
     if (serverStarting) {
       onProgress({ stage: 'starting-server', message: `Waiting for server to respond… (${elapsedSec}s)` })
-    } else if (downloadComplete || loadingStarted) {
-      onProgress({ stage: 'loading-model', message: `Loading model into memory… (${elapsedSec}s elapsed)` })
+      return
     }
-    // Still in download phase — stderr parser is providing progress, no heartbeat needed
+
+    if (downloadComplete || loadingStarted) {
+      onProgress({ stage: 'loading-model', message: `Loading model into memory… (${elapsedSec}s elapsed)` })
+      return
+    }
+
+    // No download or loading messages seen yet. After a few seconds assume we
+    // are loading from cache (model was already downloaded) and say so.
+    if (!hasSeenDownloadProgress && timeSinceSpawn > 4000) {
+      loadingStarted = true // prevent re-entering the download branch
+      onProgress({ stage: 'loading-model', message: `Loading model from cache… (${elapsedSec}s elapsed)` })
+      return
+    }
+
+    // Still very early — server just spawned, no output yet
+    if (timeSinceSpawn <= 4000) {
+      onProgress({ stage: 'loading-model', message: 'Initialising model runtime…' })
+    }
   } : undefined)
 }
 
@@ -391,9 +433,15 @@ function parseServerOutput(text: string, emit: (p: ServerProgress) => void): voi
       /Loading model (from|weights|checkpoint)/i.test(line) ||
       /^Loading weights/i.test(line) ||
       /Compiling model/i.test(line) ||
-      /Warming up/i.test(line)
+      /Warming up/i.test(line) ||
+      /Tokenizer/i.test(line) ||
+      /quantiz/i.test(line) ||
+      /shard/i.test(line) ||
+      /mlx\.core/i.test(line) ||
+      /metal/i.test(line) ||
+      /Fusing/i.test(line)
     ) {
-      emit({ stage: 'loading-model', message: line.slice(0, 120) })
+      emit({ stage: 'loading-model', message: 'Loading model…', detail: line.slice(0, 140) })
       continue
     }
 
@@ -457,6 +505,16 @@ function parseServerOutput(text: string, emit: (p: ServerProgress) => void): voi
     // ── Generic download/fetch mention ──────────────────────────────────────
     if (/\bdownload\b|\bfetch\b/i.test(line) && line.length < 200) {
       emit({ stage: 'downloading-model', message: line.slice(0, 120) })
+      continue
+    }
+
+    // ── Catch-all: forward any readable non-tqdm line as loading detail ─────
+    // Avoids forwarding raw tqdm bar lines full of unicode block characters
+    // but surfaces any other informational message mlx_lm emits.
+    const hasBlockChars = /[█▏▎▍▌▋▊▉▐░▒▓]/.test(line)
+    const looksLikePath = /\//.test(line)
+    if (!hasBlockChars && line.length > 4 && line.length < 200 && (looksLikePath || /[a-zA-Z]{4,}/.test(line))) {
+      emit({ stage: 'loading-model', message: 'Loading model…', detail: line.slice(0, 140) })
     }
   }
 }

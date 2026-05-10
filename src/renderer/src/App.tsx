@@ -1,16 +1,18 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { DEFAULT_MODEL, type SetupStatus } from '@shared/types'
 import Setup from './components/Setup'
 import Chat from './components/Chat'
 
 type AppState =
   | { phase: 'boot' }
-  | { phase: 'setup'; status: SetupStatus; model: string }
+  | { phase: 'setup'; status: SetupStatus; model: string; loadingStageEnteredAt?: number }
   | { phase: 'ready'; model: string }
-  | { phase: 'switching'; model: string; toModel: string; status: SetupStatus }
+  | { phase: 'switching'; model: string; toModel: string; status: SetupStatus; loadingStageEnteredAt?: number }
 
 export default function App() {
   const [state, setState] = useState<AppState>({ phase: 'boot' })
+  // Track the last stage so we know when loadingStageEnteredAt should reset
+  const lastStageRef = useRef<string | null>(null)
 
   useEffect(() => {
     // Forward raw Gemma output to devtools console for debugging
@@ -23,24 +25,40 @@ export default function App() {
       unsub = window.api.onSetupStatus((status) => {
         setState((prev) => {
           if (status.stage === 'ready') {
-            // If we were switching, the new model is now ready
+            // Only transition to the chat screen from a proper setup phase.
+            // If we are still in 'boot' (async init not yet complete), ignore
+            // the early ready signal — the init flow will call startSetup again.
             if (prev.phase === 'switching') {
               return { phase: 'ready', model: prev.toModel }
             }
-            return { phase: 'ready', model: prev.phase === 'setup' ? prev.model : DEFAULT_MODEL }
+            if (prev.phase === 'setup') {
+              return { phase: 'ready', model: prev.model }
+            }
+            // boot or already-ready: ignore to prevent premature chat display
+            return prev
           }
           if (status.stage === 'error') {
-            // If switch failed, go back to the previous model
+            // If switch failed, revert to the previous model's chat screen
             if (prev.phase === 'switching') {
               return { phase: 'ready', model: prev.model }
             }
           }
-          // If we're in switching phase, keep it as switching
+          // Track when we enter a slow phase so the UI can show a live timer
+          const isSlowStage = status.stage === 'loading-model' || status.stage === 'starting-server'
+          const stageChanged = lastStageRef.current !== status.stage
+          if (stageChanged) lastStageRef.current = status.stage
+          const loadingStageEnteredAt = isSlowStage && stageChanged
+            ? Date.now()
+            : (prev.phase === 'setup' || prev.phase === 'switching')
+              ? prev.loadingStageEnteredAt
+              : undefined
+
+          // Keep switching phase alive while model is loading
           if (prev.phase === 'switching') {
-            return { ...prev, status }
+            return { ...prev, status, loadingStageEnteredAt }
           }
           const model = prev.phase === 'setup' ? prev.model : DEFAULT_MODEL
-          return { phase: 'setup', status, model }
+          return { phase: 'setup', status, model, loadingStageEnteredAt }
         })
       })
 
@@ -96,10 +114,12 @@ export default function App() {
         <Setup
           status={state.status}
           model={state.model}
+          loadingStageEnteredAt={state.loadingStageEnteredAt}
           onModelChange={(m) =>
             setState((s) => (s.phase === 'setup' ? { ...s, model: m } : s))
           }
           onStart={(model) => {
+            lastStageRef.current = null
             setState({
               phase: 'setup',
               status: { stage: 'checking', message: 'Checking system…' },
@@ -116,7 +136,7 @@ export default function App() {
     return (
       <div key="switching" className="anim-fade-in h-full w-full">
         <Chat model={state.model} onSwitchModel={handleSwitchModel} />
-        <SwitchingOverlay status={state.status} />
+        <SwitchingOverlay status={state.status} loadingStageEnteredAt={state.loadingStageEnteredAt} />
       </div>
     )
   }
@@ -136,13 +156,23 @@ function BootSplash() {
   )
 }
 
-function SwitchingOverlay({ status }: { status: SetupStatus }) {
+function SwitchingOverlay({
+  status,
+  loadingStageEnteredAt
+}: {
+  status: SetupStatus
+  loadingStageEnteredAt?: number
+}) {
+  const elapsed = useElapsedSeconds(
+    (status.stage === 'loading-model' || status.stage === 'starting-server') && !!loadingStageEnteredAt,
+    loadingStageEnteredAt
+  )
   const isLoading = status.stage === 'loading-model' || status.stage === 'starting-server'
   const showBar = status.stage === 'downloading-model' && status.progress != null && status.progress > 0
 
   return (
     <div className="anim-fade-in fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
-      <div className="anim-fade-up flex w-72 flex-col items-center gap-4 rounded-2xl border border-white/10 bg-ink-950 px-10 py-8 shadow-2xl">
+      <div className="anim-fade-up flex w-80 flex-col items-center gap-4 rounded-2xl border border-white/10 bg-ink-950 px-8 py-8 shadow-2xl">
         <div className="shimmer h-1 w-32 rounded-full" />
         <p className="text-center text-sm text-ink-200">{status.message}</p>
         {showBar && (
@@ -160,13 +190,41 @@ function SwitchingOverlay({ status }: { status: SetupStatus }) {
           </div>
         )}
         {isLoading && (
-          <p className="text-center text-[11px] leading-relaxed text-ink-500">
-            {status.stage === 'loading-model'
-              ? 'Mapping model weights into RAM — may take 1–2 minutes for large models.'
-              : 'Waiting for the inference server to come online…'}
-          </p>
+          <div className="w-full space-y-2">
+            <div className="flex items-center justify-between text-[11px] text-ink-400">
+              <span>{status.stage === 'loading-model' ? 'Loading weights into RAM' : 'Starting server'}</span>
+              <span className="tabular-nums">{elapsed}s</span>
+            </div>
+            {status.detail && (
+              <p className="truncate rounded bg-white/5 px-2 py-1 font-mono text-[10px] text-ink-400">
+                {status.detail}
+              </p>
+            )}
+            <p className="text-center text-[11px] leading-relaxed text-ink-500">
+              {status.stage === 'loading-model'
+                ? 'Mapping model weights into RAM — may take 1–2 min for large models.'
+                : 'Waiting for the inference server to respond…'}
+            </p>
+          </div>
         )}
       </div>
     </div>
   )
+}
+
+/** Counts up from zero in whole seconds while active is true. Resets on anchor change. */
+function useElapsedSeconds(active: boolean, anchorMs?: number): number {
+  const [elapsed, setElapsed] = useState(0)
+  useEffect(() => {
+    if (!active) {
+      setElapsed(0)
+      return
+    }
+    const base = anchorMs ?? Date.now()
+    const tick = (): void => setElapsed(Math.round((Date.now() - base) / 1000))
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
+  }, [active, anchorMs])
+  return elapsed
 }
