@@ -314,6 +314,9 @@ export async function startServer(
   // Track whether we have seen any HF download progress so we know if the
   // model is loading from cache (no download output) vs. downloading fresh.
   let hasSeenDownloadProgress = false
+  // Track the highest layer index seen so weight-loading messages can say
+  // "layer N of N" once we've seen a few layers.
+  let maxLayerSeen = -1
 
   const spawnTime = Date.now()
 
@@ -330,7 +333,7 @@ export async function startServer(
   )
   currentModel = model
 
-  function handleProgress(p: ServerProgress): void {
+  function handleProgress(p: ServerProgress & { _layerNum?: number }): void {
     if (!onProgress) return
     if (p.stage === 'loading-model') loadingStarted = true
     if (p.stage === 'starting-server') serverStarting = true
@@ -338,20 +341,26 @@ export async function startServer(
       hasSeenDownloadProgress = true
       if (p.progress === 1.0) downloadComplete = true
     }
-    onProgress(p)
+    // Track highest layer index seen — used to annotate "layer N of N"
+    if (p._layerNum !== undefined && p._layerNum > maxLayerSeen) {
+      maxLayerSeen = p._layerNum
+    }
+    // Strip internal-only field before forwarding
+    const { _layerNum: _, ...forward } = p
+    onProgress(forward)
   }
 
   serverProc.stdout?.on('data', (d) => {
     const text = d.toString()
     console.log('[mlx stdout]', text.trim())
-    if (onProgress) parseServerOutput(text, handleProgress)
+    if (onProgress) parseServerOutput(text, handleProgress, () => maxLayerSeen)
   })
 
   serverProc.stderr?.on('data', (d) => {
     const text = d.toString()
     stderrBuf += text
     console.log('[mlx stderr]', text.trim())
-    if (onProgress) parseServerOutput(text, handleProgress)
+    if (onProgress) parseServerOutput(text, handleProgress, () => maxLayerSeen)
   })
 
   serverProc.on('exit', (code) => {
@@ -409,7 +418,11 @@ export async function startServer(
  *  Server-start phase:
  *    "Starting httpd at 127.0.0.1:11434"
  */
-function parseServerOutput(text: string, emit: (p: ServerProgress) => void): void {
+function parseServerOutput(
+  text: string,
+  emit: (p: ServerProgress & { _layerNum?: number }) => void,
+  getMaxLayer: () => number = () => -1
+): void {
   // Split on \r or \n so tqdm overwrite-style bars show as separate entries
   const lines = text.split(/[\r\n]+/)
 
@@ -499,6 +512,41 @@ function parseServerOutput(text: string, emit: (p: ServerProgress) => void): voi
           detail: speed ? `${done} / ${total}  ·  ${speed}` : `${done} / ${total}`
         })
       }
+      continue
+    }
+
+    // ── Per-layer weight tensor lines ───────────────────────────────────────
+    // mlx_lm prints each weight key as it loads it, e.g.:
+    //   "language_model.model.layers.34.self_attn.v_proj.weight."
+    //   "model.embed_tokens.weight."
+    // We parse the layer number so we can show "Loading weights — layer N of N"
+    const layerMatch = line.match(/\.layers\.(\d+)\./)
+    if (layerMatch) {
+      const layerNum = parseInt(layerMatch[1], 10)
+      const prevMax = getMaxLayer()
+      // Strip trailing dot that mlx_lm sometimes appends
+      const cleanKey = line.replace(/\.$/, '')
+      // Extract just the component name after the layer (e.g. "self_attn.v_proj")
+      const componentMatch = cleanKey.match(/\.layers\.\d+\.(.+)/)
+      const component = componentMatch ? componentMatch[1] : cleanKey
+      // Once we've seen multiple layers, we know the highest so far — show it
+      const maxKnown = Math.max(prevMax, layerNum)
+      const layerLabel = prevMax > 0
+        ? `layer ${layerNum} of ${maxKnown}`
+        : `layer ${layerNum}`
+      emit({
+        stage: 'loading-model',
+        message: `Loading weights — ${layerLabel}`,
+        detail: component.slice(0, 80),
+        _layerNum: layerNum
+      })
+      continue
+    }
+
+    // ── Other weight / tensor lines (embed, norm, lm_head, etc.) ────────────
+    if (/\.(weight|bias|norm|embed|proj|head)\b/.test(line) && !/[█▏▎▍▌▋▊▉▐░▒▓]/.test(line)) {
+      const cleanKey = line.replace(/\.$/, '')
+      emit({ stage: 'loading-model', message: 'Loading weights…', detail: cleanKey.slice(0, 120) })
       continue
     }
 
