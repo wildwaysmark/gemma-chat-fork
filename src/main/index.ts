@@ -117,9 +117,10 @@ async function ensureMLXRunning(model: string): Promise<string> {
   })
   await startServer(pythonToUse, model, (p) => {
     send('setup:status', {
-      stage: 'downloading-model',
+      stage: p.stage ?? 'downloading-model',
       message: p.message,
-      progress: p.progress
+      progress: p.progress,
+      detail: p.detail
     })
   })
   return pythonToUse
@@ -489,9 +490,10 @@ app.whenReady().then(async () => {
       }
       await startServer(mlxPython, model, (p) => {
         send('setup:status', {
-          stage: 'downloading-model',
+          stage: p.stage ?? 'downloading-model',
           message: p.message,
-          progress: p.progress
+          progress: p.progress,
+          detail: p.detail
         })
       })
       send('setup:status', { stage: 'ready', message: 'Ready to chat.' })

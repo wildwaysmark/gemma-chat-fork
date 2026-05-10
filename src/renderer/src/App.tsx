@@ -137,23 +137,34 @@ function BootSplash() {
 }
 
 function SwitchingOverlay({ status }: { status: SetupStatus }) {
+  const isLoading = status.stage === 'loading-model' || status.stage === 'starting-server'
+  const showBar = status.stage === 'downloading-model' && status.progress != null && status.progress > 0
+
   return (
     <div className="anim-fade-in fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
-      <div className="anim-fade-up flex flex-col items-center gap-4 rounded-2xl border border-white/10 bg-ink-950 px-10 py-8 shadow-2xl">
+      <div className="anim-fade-up flex w-72 flex-col items-center gap-4 rounded-2xl border border-white/10 bg-ink-950 px-10 py-8 shadow-2xl">
         <div className="shimmer h-1 w-32 rounded-full" />
-        <p className="text-sm text-ink-200">{status.message}</p>
-        {status.progress != null && status.progress > 0 && (
-          <div className="w-48">
+        <p className="text-center text-sm text-ink-200">{status.message}</p>
+        {showBar && (
+          <div className="w-full">
             <div className="h-1 w-full rounded-full bg-white/10">
               <div
                 className="h-full rounded-full bg-white/60 transition-all duration-500"
-                style={{ width: `${Math.round(status.progress * 100)}%` }}
+                style={{ width: `${Math.round((status.progress ?? 0) * 100)}%` }}
               />
             </div>
-            <p className="mt-1 text-center text-[10px] text-ink-400">
-              {Math.round(status.progress * 100)}%
-            </p>
+            <div className="mt-1 flex justify-between text-[10px] tabular-nums text-ink-400">
+              <span>{Math.round((status.progress ?? 0) * 100)}%</span>
+              {status.detail && <span className="truncate pl-2">{status.detail}</span>}
+            </div>
           </div>
+        )}
+        {isLoading && (
+          <p className="text-center text-[11px] leading-relaxed text-ink-500">
+            {status.stage === 'loading-model'
+              ? 'Mapping model weights into RAM — may take 1–2 minutes for large models.'
+              : 'Waiting for the inference server to come online…'}
+          </p>
         )}
       </div>
     </div>

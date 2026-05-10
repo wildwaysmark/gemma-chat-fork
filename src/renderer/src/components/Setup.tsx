@@ -25,11 +25,18 @@ export default function Setup({ status, model, onModelChange, onStart }: Props) 
     status.stage === 'checking' ||
     status.stage === 'installing-mlx' ||
     status.stage === 'starting-mlx' ||
-    status.stage === 'downloading-model'
+    status.stage === 'downloading-model' ||
+    status.stage === 'loading-model' ||
+    status.stage === 'starting-server'
 
   if (status.stage === 'checking' && status.message === 'Welcome') {
     return <WelcomeScreen model={model} onModelChange={onModelChange} onStart={onStart} />
   }
+
+  const showProgressBar =
+    isWorking &&
+    status.stage === 'downloading-model' &&
+    status.progress != null
 
   return (
     <div className="drag flex h-full w-full flex-col">
@@ -46,7 +53,7 @@ export default function Setup({ status, model, onModelChange, onStart }: Props) 
 
           <StageList status={status} />
 
-          {isWorking && status.progress != null && (
+          {showProgressBar && (
             <div className="mt-6">
               <div className="h-[3px] w-full overflow-hidden rounded-full bg-white/5">
                 <div
@@ -62,13 +69,35 @@ export default function Setup({ status, model, onModelChange, onStart }: Props) 
                   </span>
                 )}
               </div>
+              {status.detail && (
+                <div className="mt-1 truncate text-[11px] text-ink-400">{status.detail}</div>
+              )}
+            </div>
+          )}
+
+          {/* Loading / server-starting spinner with elapsed time */}
+          {isWorking &&
+            (status.stage === 'loading-model' || status.stage === 'starting-server') && (
+            <div className="mt-6 rounded-lg border border-white/5 bg-white/[0.03] px-4 py-3">
+              <div className="flex items-center gap-2">
+                <div className="shimmer h-1 w-16 rounded-full" />
+                <span className="text-[12px] text-ink-300">{status.message}</span>
+              </div>
+              {status.stage === 'loading-model' && (
+                <p className="mt-2 text-[11px] leading-relaxed text-ink-500">
+                  Model weights are being mapped into RAM. Large models can take 1–2 minutes.
+                  Your Mac is not frozen — this is normal.
+                </p>
+              )}
             </div>
           )}
 
           {status.stage === 'error' && (
             <div className="mt-6 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-300">
               <div className="font-medium">Something went wrong</div>
-              <div className="mt-1 text-red-300/80">{status.error}</div>
+              <div className="mt-1 whitespace-pre-wrap break-words text-[12px] text-red-300/80">
+                {status.error}
+              </div>
               <button
                 onClick={() => onStart(model)}
                 className="mt-3 rounded-md border border-white/10 bg-white/5 px-3 py-1.5 text-xs hover:bg-white/10"
@@ -156,30 +185,49 @@ function WelcomeScreen({
 }
 
 function StageList({ status }: { status: SetupStatus }) {
-  const stages: Array<{ key: SetupStatus['stage']; label: string }> = [
-    { key: 'installing-mlx', label: 'Install MLX runtime' },
-    { key: 'starting-mlx', label: 'Start runtime & load model' },
-    { key: 'downloading-model', label: 'Download model' },
-    { key: 'ready', label: 'Ready to chat' }
+  // Each entry in the visual list maps to one or more internal stages
+  const stages: Array<{ keys: SetupStatus['stage'][]; label: string }> = [
+    { keys: ['installing-mlx'],                               label: 'Install MLX runtime' },
+    { keys: ['starting-mlx'],                                 label: 'Start runtime' },
+    { keys: ['downloading-model'],                            label: 'Download model files' },
+    { keys: ['loading-model'],                                label: 'Load model into memory' },
+    { keys: ['starting-server'],                              label: 'Start server' },
+    { keys: ['ready'],                                        label: 'Ready to chat' },
   ]
+
+  // Ordered list of stages used to compute done / active / pending
   const order: SetupStatus['stage'][] = [
     'checking',
     'installing-mlx',
     'starting-mlx',
     'downloading-model',
-    'ready'
+    'loading-model',
+    'starting-server',
+    'ready',
   ]
   const currentIdx = order.indexOf(status.stage)
 
   return (
     <div className="space-y-3">
       {stages.map((s) => {
-        const idx = order.indexOf(s.key)
-        const state = idx < currentIdx ? 'done' : idx === currentIdx ? 'active' : 'pending'
+        // A stage row is "done" when all its keys are past, "active" when any key is current
+        const indices = s.keys.map((k) => order.indexOf(k))
+        const minIdx = Math.min(...indices)
+        const maxIdx = Math.max(...indices)
+
+        let state: 'done' | 'active' | 'pending'
+        if (maxIdx < currentIdx) state = 'done'
+        else if (minIdx <= currentIdx) state = 'active'
+        else state = 'pending'
+
+        const isActive = state === 'active'
+
         return (
-          <div key={s.key} className="flex items-center gap-3">
-            <StageDot state={state} />
-            <div className="flex-1">
+          <div key={s.keys[0]} className="flex items-start gap-3">
+            <div className="mt-[2px]">
+              <StageDot state={state} />
+            </div>
+            <div className="flex-1 min-w-0">
               <div
                 className={`text-sm transition ${
                   state === 'pending'
@@ -189,7 +237,7 @@ function StageList({ status }: { status: SetupStatus }) {
                       : 'text-ink-200'
                 }`}
               >
-                {state === 'active' && status.message ? status.message : s.label}
+                {isActive && status.message ? status.message : s.label}
               </div>
             </div>
           </div>

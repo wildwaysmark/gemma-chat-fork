@@ -261,9 +261,13 @@ function runProcess(
 // ---------------------------------------------------------------------------
 
 export interface ServerProgress {
+  /** Which setup stage this update belongs to */
+  stage?: 'downloading-model' | 'loading-model' | 'starting-server'
   message: string
   /** 0.0–1.0 progress fraction, if available */
   progress?: number
+  /** Per-file detail line (file name, transfer size, speed) */
+  detail?: string
 }
 
 export async function startServer(
@@ -278,7 +282,6 @@ export async function startServer(
 
   const env = {
     ...process.env,
-    // HuggingFace cache dir — keep models in our app data
     HF_HOME: modelsDir(),
     TRANSFORMERS_CACHE: modelsDir(),
     HF_HUB_DISABLE_TELEMETRY: '1'
@@ -287,6 +290,11 @@ export async function startServer(
   // Track early exit so waitForHealth can bail out immediately
   let earlyExit: { code: number | null; stderr: string } | null = null
   let stderrBuf = ''
+
+  // Phase flags — raised by the stderr parser, read by the health-check heartbeat
+  let downloadComplete = false
+  let loadingStarted = false
+  let serverStarting = false
 
   console.log(`[mlx] Starting server: ${python} -m mlx_lm.server --model ${model} --port ${MLX_PORT}`)
 
@@ -301,37 +309,27 @@ export async function startServer(
   )
   currentModel = model
 
-  serverProc.stdout?.on('data', (d) => console.log('[mlx]', d.toString().trim()))
+  function handleProgress(p: ServerProgress): void {
+    if (!onProgress) return
+    if (p.stage === 'loading-model') loadingStarted = true
+    if (p.stage === 'starting-server') serverStarting = true
+    if (p.stage === 'downloading-model' && p.progress === 1.0) downloadComplete = true
+    onProgress(p)
+  }
+
+  serverProc.stdout?.on('data', (d) => {
+    const text = d.toString()
+    console.log('[mlx stdout]', text.trim())
+    if (onProgress) parseServerOutput(text, handleProgress)
+  })
+
   serverProc.stderr?.on('data', (d) => {
     const text = d.toString()
     stderrBuf += text
-    console.log('[mlx]', text.trim())
-
-    // Parse HuggingFace download progress from stderr
-    // Format: "Fetching 8 files:  50%|█████     | 4/8 [00:55<00:59, 14.98s/it]"
-    if (onProgress) {
-      const lines = text.split('\n')
-      for (const line of lines) {
-        // Match "Fetching N files: XX%" pattern
-        const fetchMatch = line.match(/Fetching\s+(\d+)\s+files?:\s+(\d+)%.*?(\d+)\/(\d+)/)
-        if (fetchMatch) {
-          const pct = parseInt(fetchMatch[2], 10)
-          const done = parseInt(fetchMatch[3], 10)
-          const total = parseInt(fetchMatch[4], 10)
-          onProgress({
-            message: `Downloading model files… ${done}/${total}`,
-            progress: pct / 100
-          })
-          continue
-        }
-
-        // Match loading messages
-        if (line.includes('Starting httpd') || line.includes('starting')) {
-          onProgress({ message: 'Starting server…', progress: 1.0 })
-        }
-      }
-    }
+    console.log('[mlx stderr]', text.trim())
+    if (onProgress) parseServerOutput(text, handleProgress)
   })
+
   serverProc.on('exit', (code) => {
     console.log('[mlx] server exited with code', code)
     earlyExit = { code, stderr: stderrBuf }
@@ -341,7 +339,126 @@ export async function startServer(
 
   // Wait for the server to become healthy.
   // First run downloads model weights from HuggingFace, so allow up to 10 min.
-  await waitForHealth(600_000, () => earlyExit)
+  await waitForHealth(600_000, () => earlyExit, onProgress ? (elapsedSec) => {
+    if (serverStarting) {
+      onProgress({ stage: 'starting-server', message: `Waiting for server to respond… (${elapsedSec}s)` })
+    } else if (downloadComplete || loadingStarted) {
+      onProgress({ stage: 'loading-model', message: `Loading model into memory… (${elapsedSec}s elapsed)` })
+    }
+    // Still in download phase — stderr parser is providing progress, no heartbeat needed
+  } : undefined)
+}
+
+/**
+ * Parse a chunk of text output from mlx_lm.server and emit structured progress.
+ *
+ * mlx_lm writes to stderr (and sometimes stdout). Key patterns:
+ *
+ *  Download phase (HuggingFace Hub tqdm bars written to stderr):
+ *    "Fetching 8 files:  50%|████ | 4/8 [00:55<00:59, 14.98s/it]"
+ *    "model.safetensors:  45%|████ | 1.23G/2.74G [01:23<01:40, 15.2MB/s]"
+ *    "tokenizer.json: 100%|██| 428k/428k [00:01<00:00, 312kB/s]"
+ *
+ *  Post-download loading phase:
+ *    "Fetching 8 files: 100%|████| 8/8 [04:12<00:00, 31.60s/it]"
+ *    "Loading model from /path/to/cache"
+ *    "Loading weights" / "Loading model weights"
+ *
+ *  Server-start phase:
+ *    "Starting httpd at 127.0.0.1:11434"
+ */
+function parseServerOutput(text: string, emit: (p: ServerProgress) => void): void {
+  // Split on \r or \n so tqdm overwrite-style bars show as separate entries
+  const lines = text.split(/[\r\n]+/)
+
+  for (const raw of lines) {
+    const line = raw.trim()
+    if (!line) continue
+
+    // ── Server startup ──────────────────────────────────────────────────────
+    if (
+      /Starting httpd/i.test(line) ||
+      /Server started/i.test(line) ||
+      /Uvicorn running/i.test(line) ||
+      /Application startup complete/i.test(line)
+    ) {
+      emit({ stage: 'starting-server', message: 'Server is starting up…', progress: 1.0 })
+      continue
+    }
+
+    // ── Post-download model loading ─────────────────────────────────────────
+    if (
+      /Loading model (from|weights|checkpoint)/i.test(line) ||
+      /^Loading weights/i.test(line) ||
+      /Compiling model/i.test(line) ||
+      /Warming up/i.test(line)
+    ) {
+      emit({ stage: 'loading-model', message: line.slice(0, 120) })
+      continue
+    }
+
+    // ── Overall HuggingFace fetch bar ───────────────────────────────────────
+    // "Fetching 8 files:  50%|████ | 4/8 [00:55<00:59, 14.98s/it]"
+    const fetchMatch = line.match(
+      /Fetching\s+(\d+)\s+files?:\s+(\d+)%[^\d]*(\d+)\/(\d+)/
+    )
+    if (fetchMatch) {
+      const pct = parseInt(fetchMatch[2], 10)
+      const done = parseInt(fetchMatch[3], 10)
+      const total = parseInt(fetchMatch[4], 10)
+
+      if (pct === 100) {
+        emit({
+          stage: 'loading-model',
+          message: `All ${total} file${total === 1 ? '' : 's'} downloaded — loading model into memory…`,
+          progress: 1.0
+        })
+      } else {
+        emit({
+          stage: 'downloading-model',
+          message: `Downloading model files — ${done} of ${total} complete (${pct}%)`,
+          progress: pct / 100
+        })
+      }
+      continue
+    }
+
+    // ── Per-file tqdm bar ───────────────────────────────────────────────────
+    // "model-00001-of-00004.safetensors:  45%|█▍ | 1.23G/2.74G [01:23<01:40, 15.2MB/s]"
+    // "tokenizer.json: 100%|██| 428k/428k [00:01<00:00, 312kB/s]"
+    const fileMatch = line.match(
+      /^([\w.\-]+\.\w+):\s+(\d+)%[^\d]*([\d.]+\s*[KMGTP]?i?[Bb]?)\/([\d.]+\s*[KMGTP]?i?[Bb]?)\s+\[([^\]]+)\]/i
+    )
+    if (fileMatch) {
+      const filename = fileMatch[1]
+      const pct = parseInt(fileMatch[2], 10)
+      const done = fileMatch[3].trim()
+      const total = fileMatch[4].trim()
+      const timeInfo = fileMatch[5]
+      const speedMatch = timeInfo.match(/([\d.]+\s*[KMGTP]?[Bi]*\/s)/i)
+      const speed = speedMatch ? speedMatch[1] : ''
+
+      if (pct === 100) {
+        emit({
+          stage: 'downloading-model',
+          message: `Downloaded ${filename}`,
+          detail: `${total} total`
+        })
+      } else {
+        emit({
+          stage: 'downloading-model',
+          message: `Downloading ${filename} (${pct}%)`,
+          detail: speed ? `${done} / ${total}  ·  ${speed}` : `${done} / ${total}`
+        })
+      }
+      continue
+    }
+
+    // ── Generic download/fetch mention ──────────────────────────────────────
+    if (/\bdownload\b|\bfetch\b/i.test(line) && line.length < 200) {
+      emit({ stage: 'downloading-model', message: line.slice(0, 120) })
+    }
+  }
 }
 
 export function stopServer(): void {
@@ -355,21 +472,23 @@ export function stopServer(): void {
 
 /**
  * Poll the server's /v1/models endpoint until it responds.
- * If the server process exits early, throw immediately.
+ * Calls onHeartbeat every ~3 seconds so the UI can show elapsed-time messages
+ * during the silent loading phase (weights being mapped into RAM).
  */
 async function waitForHealth(
   timeoutMs: number,
-  checkEarlyExit: () => { code: number | null; stderr: string } | null
+  checkEarlyExit: () => { code: number | null; stderr: string } | null,
+  onHeartbeat?: (elapsedSec: number) => void
 ): Promise<void> {
   const start = Date.now()
   let lastError: unknown = null
+  let lastHeartbeat = 0
 
   while (Date.now() - start < timeoutMs) {
-    // Check if the server process crashed
     const exit = checkEarlyExit()
     if (exit) {
       throw new Error(
-        `MLX server exited with code ${exit.code}. ${exit.stderr.slice(-500)}`
+        `MLX server exited with code ${exit.code}.\n\n${exit.stderr.slice(-800)}`
       )
     }
 
@@ -382,9 +501,16 @@ async function waitForHealth(
     } catch (e) {
       lastError = e
     }
+
+    const elapsed = Math.round((Date.now() - start) / 1000)
+    if (onHeartbeat && Date.now() - lastHeartbeat > 3000) {
+      lastHeartbeat = Date.now()
+      onHeartbeat(elapsed)
+    }
+
     await new Promise((r) => setTimeout(r, 1500))
   }
-  throw new Error(`MLX server did not become healthy within ${timeoutMs / 1000}s: ${String(lastError)}`)
+  throw new Error(`MLX server did not respond within ${timeoutMs / 1000}s: ${String(lastError)}`)
 }
 
 // ---------------------------------------------------------------------------

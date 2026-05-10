@@ -3,6 +3,8 @@ export type SetupStage =
   | 'installing-mlx'
   | 'starting-mlx'
   | 'downloading-model'
+  | 'loading-model'
+  | 'starting-server'
   | 'ready'
   | 'error'
 
@@ -12,6 +14,8 @@ export interface SetupStatus {
   progress?: number
   bytesDone?: number
   bytesTotal?: number
+  /** Per-file detail shown beneath the main message (file name, speed, etc.) */
+  detail?: string
   error?: string
 }
 
