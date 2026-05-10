@@ -336,7 +336,10 @@ export async function startServer(
     ...process.env,
     HF_HOME: modelsDir(),
     TRANSFORMERS_CACHE: modelsDir(),
-    HF_HUB_DISABLE_TELEMETRY: '1'
+    HF_HUB_DISABLE_TELEMETRY: '1',
+    // Suppress "unauthenticated requests" noise — we intentionally run without a token
+    HF_HUB_DISABLE_IMPLICIT_TOKEN: '1',
+    HUGGINGFACE_HUB_VERBOSITY: 'error'
   }
 
   // Track early exit so waitForHealth can bail out immediately
