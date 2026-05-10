@@ -17,6 +17,11 @@ export interface SetupStatus {
   /** Per-file detail shown beneath the main message (file name, speed, etc.) */
   detail?: string
   error?: string
+  /**
+   * Set when the error is a stale/incompatible model cache.
+   * The UI shows a "Clear cache & re-download" button instead of a plain retry.
+   */
+  cacheError?: boolean
 }
 
 export interface ToolCall {

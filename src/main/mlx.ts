@@ -257,6 +257,42 @@ function runProcess(
 }
 
 // ---------------------------------------------------------------------------
+// Cache management
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown when the cached model weights are not compatible with the current
+ * version of mlx-lm (e.g. the model was updated and the cache is stale).
+ * The UI shows a "Clear cache & re-download" button for this error type.
+ */
+export class CacheCompatibilityError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'CacheCompatibilityError'
+  }
+}
+
+/**
+ * Delete the HuggingFace Hub cache for a specific model so it can be
+ * re-downloaded cleanly on the next startup.
+ */
+export function clearModelCache(model: string): void {
+  // HuggingFace converts 'org/model' → 'models--org--model'
+  const folder = 'models--' + model.replace('/', '--')
+  // Try both common cache layouts (HF_HOME/hub/ and HF_HOME/ directly)
+  const candidates = [
+    join(modelsDir(), 'hub', folder),
+    join(modelsDir(), folder)
+  ]
+  for (const dir of candidates) {
+    if (existsSync(dir)) {
+      console.log(`[mlx] Deleting stale model cache: ${dir}`)
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Server lifecycle
 // ---------------------------------------------------------------------------
 
@@ -398,6 +434,21 @@ export async function startServer(
       onProgress({ stage: 'loading-model', message: 'Initialising model runtime…' })
     }
   } : undefined)
+
+  // ── Warm-up / verification ───────────────────────────────────────────────
+  //
+  // mlx_lm.server loads the model LAZILY — the HTTP server comes up quickly
+  // and responds 200 to /v1/models before a single weight is mapped into RAM.
+  // Without an explicit warm-up, the app would show the chat UI immediately,
+  // then fail on the first message.
+  //
+  // We fire a minimal chat completion request here. This blocks until the
+  // model is loaded and returns the first token (or fails with a clear error).
+  // Stderr keeps flowing during this wait, so layer-loading progress still
+  // updates the UI.
+  const elapsed = Date.now() - spawnTime
+  const verifyTimeout = Math.max(30_000, 600_000 - elapsed)
+  await verifyModelReady(model, verifyTimeout, () => stderrBuf, onProgress ? handleProgress : undefined)
 }
 
 /**
@@ -573,6 +624,85 @@ export function stopServer(): void {
     serverProc.kill('SIGTERM')
     serverProc = null
     currentModel = null
+  }
+}
+
+/**
+ * Trigger the model to load by sending a minimal chat completion request,
+ * then wait for the response.
+ *
+ * mlx_lm.server loads the model lazily on the first generation request, so
+ * the /v1/models health check passes while the model is still on disk.
+ * This function surfaces that load (and any incompatibility errors) before
+ * the user sees the chat screen.
+ *
+ * If the server returns a non-2xx response, we inspect stderrBuf to determine
+ * whether this is a known cache-incompatibility error and throw the
+ * appropriate typed error so the UI can offer a "Clear cache" button.
+ */
+async function verifyModelReady(
+  model: string,
+  timeoutMs: number,
+  getStderr: () => string,
+  onProgress?: (p: ServerProgress & { _layerNum?: number }) => void
+): Promise<void> {
+  if (onProgress) {
+    onProgress({ stage: 'loading-model', message: 'Verifying model is ready…' })
+  }
+
+  const controller = new AbortController()
+  // Heartbeat interval so the elapsed timer keeps ticking while fetch blocks
+  const heartbeatId = onProgress
+    ? setInterval(() => {
+        // The main heartbeat in waitForHealth has already stopped; keep emitting
+        // so the UI doesn't freeze during the warm-up fetch.
+        onProgress({ stage: 'starting-server', message: 'Verifying model is ready…' })
+      }, 3000)
+    : null
+
+  try {
+    const res = await fetch(`${MLX_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 1,
+        stream: false,
+        temperature: 0
+      }),
+      signal: controller.signal
+    })
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => '')
+      const stderr = getStderr()
+      // Detect the well-known mlx-lm cache incompatibility signature
+      const isCacheIssue =
+        stderr.includes('parameters not in model') ||
+        (stderr.includes('ValueError') && stderr.includes('Received') && stderr.includes('parameters'))
+      if (isCacheIssue) {
+        throw new CacheCompatibilityError(
+          'The cached model weights are not compatible with the installed mlx-lm version. ' +
+          'This usually happens when the model or mlx-lm was updated since the last download. ' +
+          'Use "Clear cache & re-download" to fix this.'
+        )
+      }
+      throw new Error(
+        `Model failed to load (HTTP ${res.status}). ` +
+        `Server said: ${(body || 'no body').slice(0, 200)}`
+      )
+    }
+
+    console.log('[mlx] Model warm-up complete — model is loaded and responding')
+  } catch (e) {
+    if ((e as Error).name === 'AbortError') {
+      throw new Error(`Model did not finish loading within ${Math.round(timeoutMs / 1000)}s.`)
+    }
+    throw e
+  } finally {
+    controller.abort()
+    if (heartbeatId) clearInterval(heartbeatId)
   }
 }
 

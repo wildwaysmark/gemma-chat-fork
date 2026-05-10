@@ -12,6 +12,8 @@ const api = {
 
   switchModel: (model: string): Promise<void> => ipcRenderer.invoke('model:switch', model),
 
+  clearModelCache: (model: string): Promise<void> => ipcRenderer.invoke('model:clear-cache', model),
+
   checkMLX: (): Promise<{ hasMLX: boolean }> => ipcRenderer.invoke('setup:status'),
 
   onSetupStatus: (cb: (s: SetupStatus) => void): (() => void) => {

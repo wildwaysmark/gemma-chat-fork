@@ -145,16 +145,30 @@ export default function Setup({ status, model, loadingStageEnteredAt, onModelCha
 
           {status.stage === 'error' && (
             <div className="mt-6 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-300">
-              <div className="font-medium">Something went wrong</div>
+              <div className="font-medium">
+                {status.cacheError ? 'Cached model is incompatible' : 'Something went wrong'}
+              </div>
               <div className="mt-1 whitespace-pre-wrap break-words text-[12px] text-red-300/80">
                 {status.error}
               </div>
-              <button
-                onClick={() => onStart(model)}
-                className="mt-3 rounded-md border border-white/10 bg-white/5 px-3 py-1.5 text-xs hover:bg-white/10"
-              >
-                Try again
-              </button>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {status.cacheError && (
+                  <button
+                    onClick={() => {
+                      window.api.clearModelCache(model).then(() => onStart(model))
+                    }}
+                    className="rounded-md border border-red-400/30 bg-red-500/20 px-3 py-1.5 text-xs text-red-200 hover:bg-red-500/30"
+                  >
+                    Clear cache &amp; re-download
+                  </button>
+                )}
+                <button
+                  onClick={() => onStart(model)}
+                  className="rounded-md border border-white/10 bg-white/5 px-3 py-1.5 text-xs hover:bg-white/10"
+                >
+                  Try again
+                </button>
+              </div>
             </div>
           )}
         </div>

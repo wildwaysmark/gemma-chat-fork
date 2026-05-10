@@ -10,6 +10,8 @@ import {
   hasModel,
   chatStream,
   listLocalModels,
+  clearModelCache,
+  CacheCompatibilityError,
   type MLXChatMessage
 } from './mlx'
 import {
@@ -132,10 +134,12 @@ async function handleSetup(model: string): Promise<void> {
     await ensureMLXRunning(model)
     send('setup:status', { stage: 'ready', message: 'Ready to chat.' })
   } catch (e) {
+    const isCacheError = e instanceof CacheCompatibilityError
     send('setup:status', {
       stage: 'error',
-      message: 'Setup failed',
-      error: (e as Error).message
+      message: isCacheError ? 'Cached model is incompatible' : 'Setup failed',
+      error: (e as Error).message,
+      cacheError: isCacheError
     })
   }
 }
@@ -513,6 +517,16 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('models:list-local', async () => {
     return listLocalModels()
+  })
+
+  // Clear the on-disk HuggingFace cache for a model so it will be
+  // re-downloaded on the next startSetup call.  Called by the UI when
+  // the user clicks "Clear cache & re-download" after a CacheCompatibilityError.
+  ipcMain.handle('model:clear-cache', async (_e, model: string) => {
+    console.log(`[main] Clearing cache for model: ${model}`)
+    stopServer()
+    clearModelCache(model)
+    mlxPython = null  // force re-check on next startSetup
   })
 
   ipcMain.handle('chat:send', async (_e, req: ChatRequest) => {
