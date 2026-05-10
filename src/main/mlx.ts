@@ -356,11 +356,11 @@ export async function startServer(
 
   const spawnTime = Date.now()
 
-  console.log(`[mlx] Starting server: ${python} -m mlx_lm.server --model ${model} --port ${MLX_PORT}`)
+  console.log(`[mlx] Starting server: ${python} -m mlx_lm server --model ${model} --port ${MLX_PORT}`)
 
   serverProc = spawn(
     python,
-    ['-m', 'mlx_lm.server', '--model', model, '--port', String(MLX_PORT)],
+    ['-m', 'mlx_lm', 'server', '--model', model, '--port', String(MLX_PORT)],
     {
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
