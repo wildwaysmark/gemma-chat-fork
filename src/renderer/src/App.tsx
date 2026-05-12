@@ -1,7 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
-import { DEFAULT_MODEL, type SetupStatus } from '@shared/types'
+import { MLX_MODELS, OLLAMA_MODELS, type SetupStatus, type ModelInfo } from '@shared/types'
 import Setup from './components/Setup'
 import Chat from './components/Chat'
+
+const PLATFORM = window.api.platform
+const DEFAULT_MODEL = window.api.defaultModel
+const AVAILABLE_MODELS: ModelInfo[] = PLATFORM === 'win32' ? OLLAMA_MODELS : MLX_MODELS
 
 type AppState =
   | { phase: 'boot' }
@@ -24,6 +28,12 @@ export default function App() {
     ;(async () => {
       unsub = window.api.onSetupStatus((status) => {
         setState((prev) => {
+          // Once in the chat screen, ignore all setup status updates.
+          // Stale stderr lines (HTTP access logs, Prompt Cache INFO messages)
+          // can arrive AFTER the ready signal and would otherwise revert the
+          // UI back to the setup screen via the catch-all branch below.
+          if (prev.phase === 'ready') return prev
+
           if (status.stage === 'ready') {
             // Only transition to the chat screen from a proper setup phase.
             // If we are still in 'boot' (async init not yet complete), ignore
@@ -44,7 +54,10 @@ export default function App() {
             }
           }
           // Track when we enter a slow phase so the UI can show a live timer
-          const isSlowStage = status.stage === 'loading-model' || status.stage === 'starting-server'
+          const isSlowStage =
+            status.stage === 'installing-mlx' ||
+            status.stage === 'loading-model' ||
+            status.stage === 'starting-server'
           const stageChanged = lastStageRef.current !== status.stage
           if (stageChanged) lastStageRef.current = status.stage
           const loadingStageEnteredAt = isSlowStage && stageChanged
@@ -114,6 +127,8 @@ export default function App() {
         <Setup
           status={state.status}
           model={state.model}
+          availableModels={AVAILABLE_MODELS}
+          platform={PLATFORM}
           loadingStageEnteredAt={state.loadingStageEnteredAt}
           onModelChange={(m) =>
             setState((s) => (s.phase === 'setup' ? { ...s, model: m } : s))

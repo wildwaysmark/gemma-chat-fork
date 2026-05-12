@@ -1,19 +1,45 @@
 import { app, shell, BrowserWindow, ipcMain, nativeTheme, session, nativeImage } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
-import { AVAILABLE_MODELS } from '@shared/types'
+import { MLX_MODELS, OLLAMA_MODELS } from '@shared/types'
 import {
   locateMLX,
   installMLX,
-  startServer,
-  stopServer,
-  hasModel,
+  startServer as mlxStartServer,
+  stopServer as mlxStopServer,
   chatStream,
-  listLocalModels,
-  clearModelCache,
+  listLocalModels as mlxListLocalModels,
+  clearModelCache as mlxClearModelCache,
+  upgradeMLX,
+  upgradeMLXFromSource,
   CacheCompatibilityError,
   type MLXChatMessage
 } from './mlx'
+import {
+  startServer as ollamaStartServer,
+  stopServer as ollamaStopServer,
+  clearModelCache as ollamaClearModelCache,
+  listLocalModels as ollamaListLocalModels,
+  checkBackendReady as ollamaCheckBackendReady,
+  OllamaNotFoundError
+} from './ollama'
+
+const IS_WINDOWS = process.platform === 'win32'
+
+/** All known models across both platforms — used for label lookups. */
+const ALL_MODELS = [...MLX_MODELS, ...OLLAMA_MODELS]
+
+function modelLabel(name: string): string {
+  return ALL_MODELS.find((m) => m.name === name)?.label ?? name
+}
+
+// Route stop/list/clear to the appropriate backend
+function stopServer(): Promise<void> {
+  return IS_WINDOWS ? ollamaStopServer() : mlxStopServer()
+}
+function listLocalModels(): Promise<string[]> {
+  return IS_WINDOWS ? ollamaListLocalModels() : mlxListLocalModels()
+}
 import {
   TOOLS,
   chatSystemPrompt,
@@ -85,6 +111,8 @@ function send(channel: string, payload: unknown): void {
 
 let mlxPython: string | null = null
 
+// ── macOS: MLX backend ───────────────────────────────────────────────────────
+
 async function ensureMLXRunning(model: string): Promise<string> {
   let mlx = locateMLX()
   if (!mlx) {
@@ -96,48 +124,115 @@ async function ensureMLXRunning(model: string): Promise<string> {
   let pythonToUse = mlx.python
 
   if (!mlx.installed) {
-    send('setup:status', {
-      stage: 'installing-mlx',
-      message: 'Installing MLX runtime…'
-    })
-    // installMLX creates the venv and returns the venv python path
+    send('setup:status', { stage: 'installing-mlx', message: 'Installing MLX runtime…' })
     pythonToUse = await installMLX((p) => {
-      send('setup:status', {
-        stage: 'installing-mlx',
-        message: p.message
-      })
+      send('setup:status', { stage: 'installing-mlx', message: p.message })
     })
   }
 
   mlxPython = pythonToUse
 
-  const label = AVAILABLE_MODELS.find((m) => m.name === model)?.label ?? model
+  const label = modelLabel(model)
   send('setup:status', { stage: 'starting-mlx', message: 'Starting model runtime…' })
   send('setup:status', {
     stage: 'downloading-model',
     message: `Loading ${label}… (first run downloads the model)`
   })
-  await startServer(pythonToUse, model, (p) => {
+
+  const progressCallback = (p: {
+    stage?: string
+    message: string
+    progress?: number
+    detail?: string
+  }): void => {
     send('setup:status', {
       stage: p.stage ?? 'downloading-model',
       message: p.message,
       progress: p.progress,
       detail: p.detail
     })
-  })
+  }
+
+  try {
+    await mlxStartServer(pythonToUse, model, progressCallback)
+  } catch (firstErr) {
+    if (!(firstErr instanceof CacheCompatibilityError)) throw firstErr
+
+    // ── Level 1: upgrade from PyPI ─────────────────────────────────────────
+    console.log('[main] CacheCompatibilityError — upgrading mlx-lm from PyPI and retrying')
+    send('setup:status', { stage: 'installing-mlx', message: 'Upgrading mlx-lm for Gemma 4 support…' })
+    await upgradeMLX(pythonToUse, (p) => {
+      send('setup:status', { stage: 'installing-mlx', message: p.message })
+    })
+    await mlxStopServer()
+    send('setup:status', { stage: 'downloading-model', message: `Restarting ${label} with updated runtime…` })
+
+    try {
+      await mlxStartServer(pythonToUse, model, progressCallback)
+    } catch (secondErr) {
+      if (!(secondErr instanceof CacheCompatibilityError)) throw secondErr
+
+      // ── Level 2: install from GitHub source ───────────────────────────────
+      console.log('[main] PyPI upgrade insufficient — installing mlx-lm from GitHub source')
+      send('setup:status', {
+        stage: 'installing-mlx',
+        message: 'PyPI build too old — installing mlx-lm from GitHub source…'
+      })
+      await upgradeMLXFromSource(pythonToUse, (p) => {
+        send('setup:status', { stage: 'installing-mlx', message: p.message })
+      })
+      await mlxStopServer()
+      send('setup:status', { stage: 'downloading-model', message: `Restarting ${label} with source build…` })
+
+      // Third attempt — if this also fails, handleSetup shows the error UI.
+      await mlxStartServer(pythonToUse, model, progressCallback)
+    }
+  }
+
   return pythonToUse
+}
+
+// ── Windows: Ollama backend ──────────────────────────────────────────────────
+
+async function ensureOllamaRunning(model: string): Promise<void> {
+  const label = modelLabel(model)
+  send('setup:status', { stage: 'starting-mlx', message: 'Connecting to Ollama…' })
+  send('setup:status', {
+    stage: 'downloading-model',
+    message: `Loading ${label}… (first run downloads the model)`
+  })
+
+  await ollamaStartServer(model, (p) => {
+    send('setup:status', {
+      stage: p.stage ?? 'downloading-model',
+      message: p.message,
+      progress: p.progress,
+      bytesDone: p.bytesDone,
+      bytesTotal: p.bytesTotal,
+      detail: p.detail
+    })
+  })
 }
 
 async function handleSetup(model: string): Promise<void> {
   try {
     send('setup:status', { stage: 'checking', message: 'Checking system…' })
-    await ensureMLXRunning(model)
+    if (IS_WINDOWS) {
+      await ensureOllamaRunning(model)
+    } else {
+      await ensureMLXRunning(model)
+    }
     send('setup:status', { stage: 'ready', message: 'Ready to chat.' })
   } catch (e) {
     const isCacheError = e instanceof CacheCompatibilityError
+    const isOllamaNotFound = e instanceof OllamaNotFoundError
     send('setup:status', {
       stage: 'error',
-      message: isCacheError ? 'Cached model is incompatible' : 'Setup failed',
+      message: isOllamaNotFound
+        ? 'Ollama not found'
+        : isCacheError
+          ? 'Cached model is incompatible'
+          : 'Setup failed',
       error: (e as Error).message,
       cacheError: isCacheError
     })
@@ -482,24 +577,44 @@ app.whenReady().then(async () => {
   })
 
   ipcMain.handle('model:switch', async (_e, model: string) => {
-    const label = AVAILABLE_MODELS.find((m) => m.name === model)?.label ?? model
-    send('setup:status', {
-      stage: 'downloading-model',
-      message: `Switching to ${label}…`
-    })
+    const label = modelLabel(model)
+    send('setup:status', { stage: 'downloading-model', message: `Switching to ${label}…` })
     try {
-      await stopServer()
-      if (!mlxPython) {
-        throw new Error('MLX Python path not available. Please restart the app.')
-      }
-      await startServer(mlxPython, model, (p) => {
-        send('setup:status', {
-          stage: p.stage ?? 'downloading-model',
-          message: p.message,
-          progress: p.progress,
-          detail: p.detail
+      if (IS_WINDOWS) {
+        await ollamaStopServer()
+        await ollamaStartServer(model, (p) => {
+          send('setup:status', {
+            stage: p.stage ?? 'downloading-model',
+            message: p.message,
+            progress: p.progress,
+            bytesDone: p.bytesDone,
+            bytesTotal: p.bytesTotal,
+            detail: p.detail
+          })
         })
-      })
+      } else {
+        await mlxStopServer()
+        // BUG-09 fix: if mlxPython was never set (e.g. app restarted between
+        // setup and switch), re-detect rather than crashing immediately.
+        if (!mlxPython) {
+          const detected = locateMLX()
+          if (detected?.installed) {
+            mlxPython = detected.python
+          } else {
+            throw new Error(
+              'MLX Python path not available. Please return to the setup screen and re-run setup.'
+            )
+          }
+        }
+        await mlxStartServer(mlxPython, model, (p) => {
+          send('setup:status', {
+            stage: p.stage ?? 'downloading-model',
+            message: p.message,
+            progress: p.progress,
+            detail: p.detail
+          })
+        })
+      }
       send('setup:status', { stage: 'ready', message: 'Ready to chat.' })
     } catch (e) {
       send('setup:status', {
@@ -511,6 +626,11 @@ app.whenReady().then(async () => {
   })
 
   ipcMain.handle('setup:status', async () => {
+    if (IS_WINDOWS) {
+      // On Windows: backend is ready if Ollama binary exists and server responds
+      const ready = await ollamaCheckBackendReady()
+      return { hasMLX: ready }
+    }
     const mlx = locateMLX()
     return { hasMLX: !!(mlx && mlx.installed) }
   })
@@ -519,14 +639,19 @@ app.whenReady().then(async () => {
     return listLocalModels()
   })
 
-  // Clear the on-disk HuggingFace cache for a model so it will be
-  // re-downloaded on the next startSetup call.  Called by the UI when
-  // the user clicks "Clear cache & re-download" after a CacheCompatibilityError.
+  // Clear the local model cache so it will be re-downloaded on the next
+  // startSetup call.  Called by the UI when the user clicks "Clear cache &
+  // re-download" after a cache / compatibility error.
   ipcMain.handle('model:clear-cache', async (_e, model: string) => {
     console.log(`[main] Clearing cache for model: ${model}`)
-    stopServer()
-    clearModelCache(model)
-    mlxPython = null  // force re-check on next startSetup
+    if (IS_WINDOWS) {
+      await ollamaStopServer()
+      ollamaClearModelCache(model)
+    } else {
+      await mlxStopServer()
+      mlxClearModelCache(model)
+      mlxPython = null // force re-check on next startSetup
+    }
   })
 
   ipcMain.handle('chat:send', async (_e, req: ChatRequest) => {
@@ -594,7 +719,21 @@ app.on('window-all-closed', () => {
   }
 })
 
-app.on('before-quit', () => {
-  stopServer()
+app.on('before-quit', (e) => {
+  // BUG-22 fix: prevent the quit, await cleanup, then allow it.
+  // Without this the process could exit while Python/Ollama are still
+  // initialising, leaving orphaned ports and zombie processes.
+  e.preventDefault()
   stopWorkspaceServer()
+  const QUIT_TIMEOUT = 4000
+  const timeoutId = setTimeout(() => {
+    console.warn('[main] stopServer timed out — forcing quit')
+    app.exit(0)
+  }, QUIT_TIMEOUT)
+  stopServer()
+    .catch((err) => console.error('[main] stopServer error on quit:', err))
+    .finally(() => {
+      clearTimeout(timeoutId)
+      app.exit(0)
+    })
 })

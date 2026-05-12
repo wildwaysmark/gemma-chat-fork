@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react'
-import { AVAILABLE_MODELS, type SetupStatus } from '@shared/types'
+import { type ModelInfo, type SetupStatus } from '@shared/types'
 import gemmaLogoUrl from '../assets/gemma-logo.png'
 
 interface Props {
   status: SetupStatus
   model: string
+  availableModels: ModelInfo[]
+  platform: string
   /** Timestamp (Date.now()) when the current slow stage was entered, for elapsed timer */
   loadingStageEnteredAt?: number
   onModelChange: (m: string) => void
@@ -40,8 +42,11 @@ function useElapsedSeconds(active: boolean, anchorMs?: number): number {
   return elapsed
 }
 
-export default function Setup({ status, model, loadingStageEnteredAt, onModelChange, onStart }: Props) {
-  const isSlowStage = status.stage === 'loading-model' || status.stage === 'starting-server'
+export default function Setup({ status, model, availableModels, platform, loadingStageEnteredAt, onModelChange, onStart }: Props) {
+  const isSlowStage =
+    status.stage === 'installing-mlx' ||
+    status.stage === 'loading-model' ||
+    status.stage === 'starting-server'
   const elapsed = useElapsedSeconds(isSlowStage, loadingStageEnteredAt)
 
   const isWorking =
@@ -53,7 +58,15 @@ export default function Setup({ status, model, loadingStageEnteredAt, onModelCha
     status.stage === 'starting-server'
 
   if (status.stage === 'checking' && status.message === 'Welcome') {
-    return <WelcomeScreen model={model} onModelChange={onModelChange} onStart={onStart} />
+    return (
+      <WelcomeScreen
+        model={model}
+        availableModels={availableModels}
+        platform={platform}
+        onModelChange={onModelChange}
+        onStart={onStart}
+      />
+    )
   }
 
   const showProgressBar =
@@ -73,11 +86,11 @@ export default function Setup({ status, model, loadingStageEnteredAt, onModelCha
             <GemmaLogo className="mx-auto mb-5 h-20 w-20" />
             <h1 className="text-[22px] font-semibold tracking-tight">Setting things up</h1>
             <p className="mt-1.5 text-sm text-ink-400">
-              Everything runs locally. Nothing leaves your Mac.
+              Everything runs locally. Nothing leaves your {platform === 'win32' ? 'PC' : 'Mac'}.
             </p>
           </div>
 
-          <StageList status={status} />
+          <StageList status={status} platform={platform} />
 
           {showProgressBar && (
             <div className="mt-6">
@@ -125,9 +138,15 @@ export default function Setup({ status, model, loadingStageEnteredAt, onModelCha
 
                 {/* Contextual explanation */}
                 <p className="mt-2 text-[11px] leading-relaxed text-ink-500">
-                  {status.stage === 'loading-model'
-                    ? 'Mapping model weights into RAM. Large models can take 1–2 minutes on first load.'
-                    : 'Inference server is initialising — waiting for it to respond.'}
+                  {status.stage === 'installing-mlx'
+                    ? 'Downloading and installing the ML runtime. This only happens once (or when an upgrade is needed).'
+                    : status.stage === 'loading-model'
+                      ? 'Mapping model weights into RAM. Large models can take 1–2 minutes on first load.'
+                      : status.stage === 'starting-server'
+                        ? 'Inference server is initialising — waiting for it to respond.'
+                        : platform === 'win32'
+                          ? 'Connecting to the Ollama server…'
+                          : 'Starting the ML runtime…'}
                 </p>
               </div>
 
@@ -135,9 +154,15 @@ export default function Setup({ status, model, loadingStageEnteredAt, onModelCha
               {showLongWaitHint && (
                 <div className="rounded-lg border border-yellow-500/20 bg-yellow-500/5 px-4 py-3 text-[11px] leading-relaxed text-yellow-300/70">
                   <span className="font-medium text-yellow-300/90">Still loading ({elapsed}s).</span>{' '}
-                  {status.stage === 'loading-model'
-                    ? 'This is normal for large models on the first run — the OS is paging weights into RAM from disk. Activity Monitor → CPU tab should show Python actively running.'
-                    : 'The server process is running but not yet accepting connections. Check Activity Monitor if this continues.'}
+                  {status.stage === 'installing-mlx'
+                    ? 'Downloading the runtime from the internet. Check your network connection if this takes more than 5 minutes.'
+                    : status.stage === 'loading-model'
+                      ? platform === 'win32'
+                        ? 'This is normal for large models on the first run — Ollama is loading weights into RAM.'
+                        : 'This is normal for large models on the first run — the OS is paging weights into RAM from disk. Activity Monitor → CPU tab should show Python actively running.'
+                      : platform === 'win32'
+                        ? 'The Ollama server is running but not yet accepting connections. Check Task Manager if this continues.'
+                        : 'The server process is running but not yet accepting connections. Check Activity Monitor if this continues.'}
                 </div>
               )}
             </div>
@@ -179,14 +204,20 @@ export default function Setup({ status, model, loadingStageEnteredAt, onModelCha
 
 function WelcomeScreen({
   model,
+  availableModels,
+  platform,
   onModelChange,
   onStart
 }: {
   model: string
+  availableModels: ModelInfo[]
+  platform: string
   onModelChange: (m: string) => void
   onStart: (model: string) => void
 }) {
-  const selected = AVAILABLE_MODELS.find((m) => m.name === model) ?? AVAILABLE_MODELS[1]
+  const selected = availableModels.find((m) => m.name === model) ?? availableModels[1] ?? availableModels[0]
+  const isWindows = platform === 'win32'
+
   return (
     <div className="drag flex h-full w-full flex-col">
       <div className="h-9" />
@@ -198,7 +229,7 @@ function WelcomeScreen({
             <p className="mt-2 text-[13.5px] leading-relaxed text-ink-400">
               A local AI assistant, powered by Google's Gemma 4.
               <br />
-              Runs 100% on your Mac. No account, no cloud.
+              Runs 100% on your {isWindows ? 'PC' : 'Mac'}. No account, no cloud.
             </p>
           </div>
 
@@ -206,7 +237,7 @@ function WelcomeScreen({
             Pick a model
           </div>
           <div className="anim-stagger space-y-2">
-            {AVAILABLE_MODELS.map((m) => (
+            {availableModels.map((m) => (
               <button
                 key={m.name}
                 onClick={() => onModelChange(m.name)}
@@ -238,10 +269,12 @@ function WelcomeScreen({
             onClick={() => onStart(selected.name)}
             className="mt-6 w-full rounded-xl bg-white py-3 text-sm font-medium text-ink-900 transition hover:bg-white/90 active:scale-[0.99]"
           >
-            Download {selected.label} &nbsp;·&nbsp; {selected.size}
+            {isWindows ? 'Download' : 'Download'} {selected.label} &nbsp;·&nbsp; {selected.size}
           </button>
           <p className="mt-3 text-center text-[11px] text-ink-400">
-            We'll install MLX runtime if needed. Model weights are cached locally.
+            {isWindows
+              ? 'Requires Ollama to be installed. Model weights are downloaded and cached locally.'
+              : 'We\'ll install MLX runtime if needed. Model weights are cached locally.'}
           </p>
         </div>
       </div>
@@ -249,16 +282,27 @@ function WelcomeScreen({
   )
 }
 
-function StageList({ status }: { status: SetupStatus }) {
-  // Each entry in the visual list maps to one or more internal stages
-  const stages: Array<{ keys: SetupStatus['stage'][]; label: string }> = [
-    { keys: ['installing-mlx'],   label: 'Install MLX runtime' },
-    { keys: ['starting-mlx'],     label: 'Start runtime' },
-    { keys: ['downloading-model'], label: 'Download model files' },
-    { keys: ['loading-model'],    label: 'Load model into memory' },
-    { keys: ['starting-server'],  label: 'Start server' },
-    { keys: ['ready'],            label: 'Ready to chat' },
-  ]
+function StageList({ status, platform }: { status: SetupStatus; platform: string }) {
+  const isWindows = platform === 'win32'
+
+  // Each entry in the visual list maps to one or more internal stages.
+  // On Windows (Ollama) we skip the MLX install step and rename runtime labels.
+  const stages: Array<{ keys: SetupStatus['stage'][]; label: string }> = isWindows
+    ? [
+        { keys: ['starting-mlx'],      label: 'Connect to Ollama' },
+        { keys: ['downloading-model'],  label: 'Download model files' },
+        { keys: ['loading-model'],      label: 'Load model into memory' },
+        { keys: ['starting-server'],    label: 'Start server' },
+        { keys: ['ready'],              label: 'Ready to chat' },
+      ]
+    : [
+        { keys: ['installing-mlx'],    label: 'Install MLX runtime' },
+        { keys: ['starting-mlx'],      label: 'Start runtime' },
+        { keys: ['downloading-model'], label: 'Download model files' },
+        { keys: ['loading-model'],     label: 'Load model into memory' },
+        { keys: ['starting-server'],   label: 'Start server' },
+        { keys: ['ready'],             label: 'Ready to chat' },
+      ]
 
   // Ordered list used to compute done / active / pending
   const order: SetupStatus['stage'][] = [

@@ -220,6 +220,69 @@ export async function installMLX(
   return vPy
 }
 
+/**
+ * Upgrade mlx-lm to the latest PyPI release.
+ * Called automatically when a CacheCompatibilityError is detected (i.e. the
+ * installed mlx-lm is too old to support the model's architecture).
+ */
+export async function upgradeMLX(
+  python: string,
+  onProgress: (p: InstallProgress) => void
+): Promise<void> {
+  onProgress({ stage: 'install', message: 'Upgrading mlx-lm to latest version…' })
+  console.log(`[mlx] Upgrading mlx-lm via ${python}`)
+  await runProcess(python, [
+    '-m', 'pip', 'install', '--upgrade', 'mlx-lm',
+    '--index-url', 'https://pypi.org/simple/'
+  ], onProgress)
+  verifyMLXImport(python)
+  onProgress({ stage: 'install', message: 'mlx-lm upgrade complete — restarting…' })
+  console.log('[mlx] mlx-lm upgraded successfully')
+}
+
+/**
+ * Install mlx-lm directly from GitHub source.
+ *
+ * PyPI releases can lag behind the GitHub main branch by days to weeks.
+ * New model architectures (like Gemma 4's k_norm / per-layer k_proj) are
+ * often supported on GitHub first. This is the escalation path when a PyPI
+ * upgrade doesn't fix the incompatibility.
+ *
+ * Requires git to be available on PATH (standard on macOS with Xcode CLT).
+ */
+export async function upgradeMLXFromSource(
+  python: string,
+  onProgress: (p: InstallProgress) => void
+): Promise<void> {
+  // Use the tarball URL rather than git+https:// because:
+  //  - no git dependency (not always on PATH inside the app sandbox)
+  //  - downloads only the source archive, not the full git history
+  //  - pip shows download progress for a plain https URL
+  const tarballUrl = 'https://github.com/ml-explore/mlx-lm/archive/refs/heads/main.tar.gz'
+  onProgress({ stage: 'install', message: 'Downloading mlx-lm source from GitHub…' })
+  console.log(`[mlx] Installing mlx-lm from tarball ${tarballUrl} via ${python}`)
+  await runProcess(python, [
+    '-m', 'pip', 'install',
+    '--upgrade',
+    '--force-reinstall',
+    tarballUrl
+  ], onProgress)
+  verifyMLXImport(python)
+  onProgress({ stage: 'install', message: 'mlx-lm (source) installed — restarting…' })
+  console.log('[mlx] mlx-lm from GitHub source installed successfully')
+}
+
+function verifyMLXImport(python: string): void {
+  const check = spawnSync(python, ['-c', 'import mlx_lm; print("ok")'], {
+    timeout: 15000,
+    stdio: ['ignore', 'pipe', 'pipe']
+  })
+  if (check.status !== 0 || !check.stdout?.toString().includes('ok')) {
+    const err = check.stderr?.toString().slice(-300) || 'unknown error'
+    throw new Error(`mlx-lm installed but failed to import: ${err}`)
+  }
+}
+
 /** Run a subprocess and stream output to onProgress */
 function runProcess(
   cmd: string,
@@ -329,8 +392,8 @@ export async function startServer(
     }
   }
 
-  // Kill any existing server before spawning a new one
-  stopServer()
+  // Kill any existing server and wait for it to release the port before spawning
+  await stopServer()
 
   const env = {
     ...process.env,
@@ -484,6 +547,12 @@ function parseServerOutput(
     const line = raw.trim()
     if (!line) continue
 
+    // ── Skip noisy server runtime lines ────────────────────────────────────
+    // HTTP access log: "127.0.0.1 - - [09/May/2026 23:07:01] "POST /v1/... 200 -"
+    if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3} - - \[/.test(line)) continue
+    // Python logging: "2026-05-09 23:07:01,977 - INFO - Prompt Cache: ..."
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+ - (INFO|WARNING|ERROR|DEBUG) -/.test(line)) continue
+
     // ── Server startup ──────────────────────────────────────────────────────
     if (
       /Starting httpd/i.test(line) ||
@@ -621,13 +690,38 @@ function parseServerOutput(
   }
 }
 
-export function stopServer(): void {
-  if (serverProc && !serverProc.killed) {
-    console.log('[mlx] Stopping server')
-    serverProc.kill('SIGTERM')
+/**
+ * Stop the server process and wait for it to fully exit before returning.
+ *
+ * Sending SIGTERM and returning immediately causes a race: the Python process
+ * holds port 11434 for 1–3 s during cleanup, so a new spawn attempted right
+ * after sees "Address already in use". Awaiting the exit event (with a 3-s
+ * SIGKILL fallback) guarantees the port is free before the caller proceeds.
+ */
+export function stopServer(): Promise<void> {
+  if (!serverProc || serverProc.killed) {
     serverProc = null
     currentModel = null
+    return Promise.resolve()
   }
+  const proc = serverProc
+  serverProc = null
+  currentModel = null
+  console.log('[mlx] Stopping server — waiting for process to exit')
+  return new Promise<void>((resolve) => {
+    // Force-kill if SIGTERM hasn't worked within 3 s
+    const killTimer = setTimeout(() => {
+      console.log('[mlx] Process did not exit within 3 s — sending SIGKILL')
+      try { proc.kill('SIGKILL') } catch { /* already dead */ }
+      resolve()
+    }, 3000)
+    proc.once('exit', () => {
+      clearTimeout(killTimer)
+      console.log('[mlx] Server process exited cleanly')
+      resolve()
+    })
+    proc.kill('SIGTERM')
+  })
 }
 
 /**
@@ -639,9 +733,11 @@ export function stopServer(): void {
  * This function surfaces that load (and any incompatibility errors) before
  * the user sees the chat screen.
  *
- * If the server returns a non-2xx response, we inspect stderrBuf to determine
- * whether this is a known cache-incompatibility error and throw the
- * appropriate typed error so the UI can offer a "Clear cache" button.
+ * Key edge-case: when mlx_lm's inference thread crashes (e.g. with
+ * "ValueError: Received N parameters not in model"), it dies without ever
+ * sending an HTTP response. The fetch would then block until our AbortController
+ * fires — potentially for minutes. To avoid that, a stderr poller runs every
+ * 2 s and aborts the fetch as soon as it detects the fatal exception signature.
  */
 async function verifyModelReady(
   model: string,
@@ -654,12 +750,32 @@ async function verifyModelReady(
   }
 
   const controller = new AbortController()
+
+  // Track whether we aborted due to a detected fatal stderr error vs. timeout
+  let fatalStderrError: string | null = null
+
+  // Poll stderr every 2 s for the Thread-1 crash signature.
+  // When detected, abort the hanging fetch immediately so the caller can
+  // throw a typed error within ~2 s instead of waiting for the full timeout.
+  const stderrPollerId = setInterval(() => {
+    const stderr = getStderr()
+    const hasThreadCrash = stderr.includes('Exception in thread')
+    const hasParamError =
+      stderr.includes('parameters not in model') ||
+      (stderr.includes('ValueError') && stderr.includes('Received') && stderr.includes('parameters'))
+    if (hasThreadCrash && hasParamError) {
+      fatalStderrError = stderr
+      console.log('[mlx] Fatal thread crash detected in stderr — aborting warm-up fetch')
+      controller.abort()
+    }
+  }, 2000)
+
   // Heartbeat interval so the elapsed timer keeps ticking while fetch blocks
   const heartbeatId = onProgress
     ? setInterval(() => {
         // The main heartbeat in waitForHealth has already stopped; keep emitting
         // so the UI doesn't freeze during the warm-up fetch.
-        onProgress({ stage: 'starting-server', message: 'Verifying model is ready…' })
+        onProgress({ stage: 'loading-model', message: 'Verifying model is ready…' })
       }, 3000)
     : null
 
@@ -680,15 +796,14 @@ async function verifyModelReady(
     if (!res.ok) {
       const body = await res.text().catch(() => '')
       const stderr = getStderr()
-      // Detect the well-known mlx-lm cache incompatibility signature
+      // Detect the well-known mlx-lm version-incompatibility signature
       const isCacheIssue =
         stderr.includes('parameters not in model') ||
         (stderr.includes('ValueError') && stderr.includes('Received') && stderr.includes('parameters'))
       if (isCacheIssue) {
         throw new CacheCompatibilityError(
-          'The cached model weights are not compatible with the installed mlx-lm version. ' +
-          'This usually happens when the model or mlx-lm was updated since the last download. ' +
-          'Use "Clear cache & re-download" to fix this.'
+          'The installed mlx-lm version does not support this model\'s architecture. ' +
+          'The app will attempt to upgrade mlx-lm automatically.'
         )
       }
       throw new Error(
@@ -700,11 +815,19 @@ async function verifyModelReady(
     console.log('[mlx] Model warm-up complete — model is loaded and responding')
   } catch (e) {
     if ((e as Error).name === 'AbortError') {
+      // Distinguish: did we abort because we detected a fatal error, or timed out?
+      if (fatalStderrError) {
+        throw new CacheCompatibilityError(
+          'The installed mlx-lm version does not support this model\'s architecture. ' +
+          'The app will attempt to upgrade mlx-lm automatically.'
+        )
+      }
       throw new Error(`Model did not finish loading within ${Math.round(timeoutMs / 1000)}s.`)
     }
     throw e
   } finally {
     controller.abort()
+    clearInterval(stderrPollerId)
     if (heartbeatId) clearInterval(heartbeatId)
   }
 }

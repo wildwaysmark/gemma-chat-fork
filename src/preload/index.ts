@@ -6,8 +6,13 @@ import type {
   WorkspaceInfo,
   WorkspaceFile
 } from '../shared/types'
+import { DEFAULT_MLX_MODEL, DEFAULT_OLLAMA_MODEL } from '../shared/types'
 
 const api = {
+  /** Current OS platform — 'darwin' on macOS, 'win32' on Windows. */
+  platform: process.platform as 'darwin' | 'win32' | 'linux',
+  /** Platform-appropriate default model name. */
+  defaultModel: process.platform === 'win32' ? DEFAULT_OLLAMA_MODEL : DEFAULT_MLX_MODEL,
   startSetup: (model: string): Promise<void> => ipcRenderer.invoke('setup:start', model),
 
   switchModel: (model: string): Promise<void> => ipcRenderer.invoke('model:switch', model),
