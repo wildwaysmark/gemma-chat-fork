@@ -21,6 +21,16 @@ mac:
   gatekeeperAssess: false
 dmg:
   artifactName: ${name}-${version}.${ext}
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch: [x64]
+nsis:
+  artifactName: ${name}-${version}-setup.${ext}
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false
 npmRebuild: false
 publish:
   provider: generic
